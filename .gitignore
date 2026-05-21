@@ -1,0 +1,94 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Pretrained weights — обычно слишком большие для git
+pretrained/
+
+# Training outputs — чекпойнты
+outputs/
+
+# Real-robot eval logs
+eval/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large ML outputs
+outputs/
+eval_logs/
+session_logs/
+pretrained/
+
+# Data / datasets
+data/
+datasets/
+
+# Camera/reference local files
+reference/*.jpg
+reference/*.png
+camera_config.local.yaml
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large ML outputs
+outputs/
+eval_logs/
+session_logs/
+pretrained/
+
+# Data / datasets
+data/
+datasets/
+
+# Camera/reference local files
+reference/*.jpg
+reference/*.png
+camera_config.local.yaml
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+
+

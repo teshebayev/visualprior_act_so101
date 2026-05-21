@@ -1,0 +1,46 @@
+[project]
+name = "lerobot_policy_visualprior_act"
+version = "0.1.0"
+description = "Visual prior ACT policy plugin for LeRobot — VAE/YOLO/UNet/SAM2/DINOv2 frontends"
+readme = "README.md"
+requires-python = ">= 3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Visual Priors SO-101 team" }]
+
+dependencies = [
+    "lerobot >= 0.5.0",
+    "torch >= 2.0",
+    "torchvision",
+    "einops",
+    "safetensors",
+    "pyyaml",
+    "rich",
+]
+
+[project.optional-dependencies]
+# Установка по семьям encoders — чтобы не тянуть всё сразу
+vae = ["vector-quantize-pytorch"]
+yolo = ["ultralytics >= 8.3,<9.0"]
+unet = ["segmentation-models-pytorch"]
+foundation = ["transformers >= 4.40"]
+all = [
+    "vector-quantize-pytorch",
+    "ultralytics >= 8.3,<9.0",
+    "segmentation-models-pytorch",
+    "transformers >= 4.40",
+]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+pretrain-visual-encoder = "lerobot_policy_visualprior_act.pretraining.cli:main"
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools >= 61", "wheel"]
+
+[tool.setuptools.packages.find]
+include = ["lerobot_policy_visualprior_act*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
