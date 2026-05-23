@@ -41,22 +41,9 @@ VALID_ENCODERS = frozenset({
 @PreTrainedConfig.register_subclass("visualprior_act")
 @dataclass
 class VisualPriorACTConfig(PreTrainedConfig):
-    """Configuration for ACT with replaceable visual prior encoder.
-
-    Encoder choices:
-        - 'resnet18'   — baseline (M0) or with linear bottleneck (M1)
-        - 'vae'        — M2/M3, requires vae_pretrained_path
-        - 'beta_vae'   — M4/M5, requires vae_pretrained_path
-        - 'vqvae'      — M6/M7, requires vae_pretrained_path
-        - 'yolo'       — M8/M9, requires `ultralytics`
-        - 'unet'       — M10/M11, requires `segmentation-models-pytorch`
-        - 'yolo_bbox'  — M14 (structured features, optional)
-        - 'sam2'       — M12, requires `transformers`, frozen only
-        - 'dinov2'     — M13, requires `transformers`, frozen only
-    """
+    """Configuration for ACT with replaceable visual prior encoder."""
 
     # ---------- ACT-specific (mirrors lerobot.policies.act.ACTConfig) ----------
-    # If these defaults don't match your lerobot version, adjust here.
     n_obs_steps: int = 1
     chunk_size: int = 100
     n_action_steps: int = 100
@@ -72,23 +59,23 @@ class VisualPriorACTConfig(PreTrainedConfig):
 
     # Internal action-CVAE (z_act). Kept unchanged from standard ACT.
     use_vae: bool = True
-    latent_dim: int = 32  # size of z_act, NOT z_vis
+    latent_dim: int = 32  # size of z_act, NOT z_vis. See `vae_latent_dim` for z_vis.
     n_vae_encoder_layers: int = 4
     kl_weight: float = 10.0
 
     temporal_ensemble_coeff: Optional[float] = None
 
     # ---------- Visual encoder choice ----------
-    # NOTE: draccus (lerobot's CLI parser) doesn't support Literal types
-    # with many options, so we use plain str + runtime validation in
-    # __post_init__ against VALID_ENCODERS below.
     encoder: str = "resnet18"
 
     # Unified output dimension — projector maps every encoder to this
     projector_dim: int = 256
     projector_hidden_dim: int = 256
 
-    freeze_encoder: bool = False
+    # IMPORTANT: For VAE-family encoders the recommended workflow is
+    # pretrain -> freeze -> train policy. Default True now to avoid silently
+    # destroying pretrained features during policy training.
+    freeze_encoder: bool = True
 
     # ---------- Encoder-specific hyperparams ----------
     # ResNet baseline (Family A)
@@ -99,8 +86,13 @@ class VisualPriorACTConfig(PreTrainedConfig):
     vae_latent_dim: int = 32
     vae_pretrained_path: Optional[str] = None
     vae_beta: float = 1.0
+    # NEW: spatial VAE keeps the 7x7 grid -> 49 tokens of latent_dim each.
+    # Old single-token bottleneck (spatial=False) is preserved as ablation.
+    vae_spatial: bool = True
+    # VQ-VAE: grid_size=7 keeps the full backbone resolution (no extra pooling).
+    # The old default of 4 was an unnecessary information bottleneck.
     vqvae_codebook_size: int = 512
-    vqvae_grid_size: int = 4
+    vqvae_grid_size: int = 7
 
     # YOLO (Family C)
     yolo_model_name: str = "yolov8n"
@@ -118,9 +110,6 @@ class VisualPriorACTConfig(PreTrainedConfig):
     dinov2_model_name: str = "facebook/dinov2-small"
 
     # ---------- Spatial structure of visual tokens ----------
-    # If True, encoder preserves spatial structure and passes a sequence of
-    # tokens to the transformer (like standard ACT). If False, encoder
-    # produces a single token vector. Default True for fair comparison.
     use_spatial_tokens: bool = True
 
     # ---------- Optimizer / scheduler ----------
@@ -129,9 +118,14 @@ class VisualPriorACTConfig(PreTrainedConfig):
     optimizer_weight_decay: float = 1e-4
 
     # ---------- Normalization ----------
+    # Match stock ACT: IDENTITY for VISUAL (images stay in [0, 1] as the
+    # dataset stores them — same statistics our pretrained encoders saw).
+    # The OLD default of MEAN_STD here caused a hard distribution shift
+    # between pretraining and policy inference and was almost certainly
+    # the main cause of "policy doesn't work at eval time".
     normalization_mapping: dict = field(
         default_factory=lambda: {
-            "VISUAL": NormalizationMode.MEAN_STD,
+            "VISUAL": NormalizationMode.IDENTITY,
             "STATE": NormalizationMode.MEAN_STD,
             "ACTION": NormalizationMode.MEAN_STD,
         }
@@ -144,31 +138,37 @@ class VisualPriorACTConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
-        # Validate encoder choice (replaces the type system check we lost
-        # when switching from Literal[...] to plain str for draccus compat).
         if self.encoder not in VALID_ENCODERS:
             raise ValueError(
                 f"encoder='{self.encoder}' is invalid. "
                 f"Choose one of: {sorted(VALID_ENCODERS)}"
             )
 
-        # VAE family requires pretrained weights
-        if self.encoder in ("vae", "beta_vae", "vqvae"):
-            if self.vae_pretrained_path is None:
-                raise ValueError(
-                    f"encoder='{self.encoder}' requires vae_pretrained_path. "
-                    "Pretrain first:\n"
-                    f"    pretrain-visual-encoder --encoder-type={self.encoder} "
-                    "--dataset-repo-id=... --output-path=..."
-                )
+        # VAE family used to hard-require vae_pretrained_path here. We now
+        # downgrade this to a warning, because:
+        #   1. PreTrainedPolicy.from_pretrained() instantiates the config
+        #      first, then loads state_dict — the pretrained .safetensors is
+        #      not needed in that case, the encoder weights come from the
+        #      policy checkpoint.
+        #   2. On a different machine the original local path won't exist.
+        # _load_pretrained in encoders/__init__.py handles None gracefully.
+        if (
+            self.encoder in ("vae", "beta_vae", "vqvae")
+            and self.vae_pretrained_path is None
+        ):
+            warnings.warn(
+                f"encoder='{self.encoder}' without vae_pretrained_path. "
+                f"This is fine if you're reloading a saved policy. "
+                f"For fresh training, pretrain first:\n"
+                f"    pretrain-visual-encoder --encoder-type={self.encoder} ...",
+                stacklevel=2,
+            )
 
-        # Linear bottleneck only makes sense for resnet18
         if self.use_linear_bottleneck and self.encoder != "resnet18":
             raise ValueError(
                 "use_linear_bottleneck=True is only valid for encoder='resnet18'"
             )
 
-        # Foundation models are expensive — finetune is impractical with small datasets
         if self.encoder in ("sam2", "dinov2") and not self.freeze_encoder:
             warnings.warn(
                 f"encoder='{self.encoder}' is typically used frozen on small "
@@ -207,10 +207,6 @@ class VisualPriorACTConfig(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self):
-        # Match standard lerobot ACTConfig — return None for a constant LR.
-        # This ensures M0 (resnet18 baseline) is fairly comparable to stock ACT,
-        # since the only architectural difference is then the visual encoder
-        # path (not the optimization schedule).
         return None
 
     # ============================================================
@@ -219,12 +215,6 @@ class VisualPriorACTConfig(PreTrainedConfig):
 
     @property
     def observation_delta_indices(self) -> None:
-        # Match stock ACT: return None for plain non-temporal observations.
-        # This ensures batch[OBS_STATE] arrives as (B, state_dim) — flat 2D,
-        # the same shape the standard ACT VAE encoder expects. If we returned
-        # a list (even [0]) the dataloader would add a temporal dim and the
-        # VAE encoder's cat over [cls, state, action] would fail with rank
-        # mismatch (state 3D vs action 3D, but cls 3D — same shape needed).
         return None
 
     @property

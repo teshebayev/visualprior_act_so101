@@ -1,6 +1,20 @@
 """SAM2 encoder (Family D — foundation models).
 
 Uses SAM2 image encoder as a frozen feature extractor.
+
+Notes
+-----
+1. SAM2 was trained on ImageNet-normalized inputs at 1024x1024 resolution.
+   We pass 224x224 (matching every other encoder in this plugin) so the
+   model has to internally interpolate position embeddings or accept the
+   smaller patch grid. This works for hiera-tiny but may produce suboptimal
+   features compared to native 1024-res inference. If quality matters,
+   evaluate on native resolution by setting `sam2_input_size=1024` in your
+   policy preprocessor (and accept the much higher compute cost).
+
+2. We register SAM2-specific normalization buffers in __init__ and apply
+   them inside forward(). Input is expected in [0, 1].
+
 Requires `transformers` >= 4.40. Install:
     pip install -e ".[foundation]"
 """
@@ -8,9 +22,14 @@ Requires `transformers` >= 4.40. Install:
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 
 from .base import VisualPriorEncoder
+
+
+# SAM2 uses ImageNet-style stats (this is the documented preprocessing for
+# Hiera-based SAM2; the Mask R-CNN family of SAM ports also use ImageNet).
+_SAM2_MEAN = (0.485, 0.456, 0.406)
+_SAM2_STD = (0.229, 0.224, 0.225)
 
 
 class SAM2Encoder(VisualPriorEncoder):
@@ -31,46 +50,44 @@ class SAM2Encoder(VisualPriorEncoder):
                 'Install: pip install -e ".[foundation]"'
             ) from e
 
-        # SAM2 in transformers — load full model, use only image encoder
-        # TODO(integration): the exact API depends on transformers version.
-        # Recent transformers (>=4.42) have Sam2Model with .vision_encoder attribute.
-        # If your version differs, adjust below.
-        try:
-            full = AutoModel.from_pretrained(model_name)
-            if hasattr(full, "vision_encoder"):
-                self.vision_encoder = full.vision_encoder
-            elif hasattr(full, "image_encoder"):
-                self.vision_encoder = full.image_encoder
-            else:
-                raise AttributeError(
-                    f"Could not find vision/image encoder on {type(full)}"
-                )
-        except Exception as e:
-            raise RuntimeError(
-                f"Could not load SAM2 from {model_name}. "
-                "Check that your transformers version supports SAM2."
-            ) from e
+        # Load full model, extract image/vision encoder.
+        full = AutoModel.from_pretrained(model_name)
+        if hasattr(full, "vision_encoder"):
+            self.vision_encoder = full.vision_encoder
+        elif hasattr(full, "image_encoder"):
+            self.vision_encoder = full.image_encoder
+        else:
+            raise AttributeError(
+                f"Could not find vision/image encoder on {type(full)}. "
+                f"Check transformers version (SAM2 API moves between releases)."
+            )
 
-        # SAM2 expects images normalized differently than ImageNet
-        # We re-normalize inside forward
+        # Register normalization buffers (same shape conventions as base helper
+        # but with SAM2-specific stats — kept identical to ImageNet because
+        # that's what hiera-tiny was trained with).
         self.register_buffer(
             "_sam2_mean",
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            torch.tensor(_SAM2_MEAN, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
         )
         self.register_buffer(
             "_sam2_std",
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            torch.tensor(_SAM2_STD, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
         )
 
         self.output_dim, self.num_spatial_tokens = self._infer_output_shape()
 
+    def _normalize(self, images: torch.Tensor) -> torch.Tensor:
+        """Apply SAM2's expected normalization. Input in [0, 1]."""
+        return (images - self._sam2_mean) / self._sam2_std
+
     def _infer_output_shape(self) -> tuple[int, int]:
         self.eval()
         with torch.no_grad():
-            dummy = torch.zeros(1, 3, 224, 224)
-            out = self.vision_encoder(dummy)
-            # transformers vision encoders typically return BaseModelOutput
-            # with last_hidden_state of shape (B, N, C) or (B, C, H, W)
+            dummy = torch.full((1, 3, 224, 224), 0.5)
+            x = self._normalize(dummy)
+            out = self.vision_encoder(x)
             features = self._extract_features(out)
         if features.dim() == 3:
             _, n, c = features.shape
@@ -79,7 +96,7 @@ class SAM2Encoder(VisualPriorEncoder):
             _, c, h, w = features.shape
             return c, h * w
         else:
-            raise RuntimeError(f"Unexpected feature shape: {features.shape}")
+            raise RuntimeError(f"Unexpected SAM2 feature shape: {features.shape}")
 
     def _extract_features(self, out) -> torch.Tensor:
         """Extract feature tensor from SAM2 encoder output."""
@@ -90,13 +107,11 @@ class SAM2Encoder(VisualPriorEncoder):
         elif isinstance(out, torch.Tensor):
             return out
         else:
-            raise RuntimeError(
-                f"Unknown SAM2 encoder output type: {type(out)}"
-            )
+            raise RuntimeError(f"Unknown SAM2 encoder output type: {type(out)}")
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        # Already ImageNet-normalized from processor; SAM2 expects same stats
-        out = self.vision_encoder(images)
+        x = self._normalize(images)
+        out = self.vision_encoder(x)
         features = self._extract_features(out)
 
         if features.dim() == 4:

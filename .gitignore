@@ -14,7 +14,7 @@ pretrained/
 
 # Training outputs — чекпойнты
 outputs/
-
+outputs_vae_test/
 # Real-robot eval logs
 eval/
 

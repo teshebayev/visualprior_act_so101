@@ -1,8 +1,13 @@
 """YOLO encoders (Family C — task-supervised priors).
 
 Two variants:
-- YOLOBackboneEncoder: features from intermediate layer of YOLOv8 CSPDarknet
-- YOLOBBoxEncoder: structured features from detection output (top-K boxes)
+- YOLOBackboneEncoder: features from intermediate layer of YOLOv8 CSPDarknet.
+  Bypasses YOLO's built-in preprocessing, so we apply ImageNet normalization
+  manually (YOLOv8 was pretrained on COCO with ImageNet stats).
+
+- YOLOBBoxEncoder: structured features from detection output (top-K boxes).
+  Uses YOLO.predict() which handles preprocessing internally — we pass raw
+  [0, 1] tensors to it directly.
 
 Requires `ultralytics`. Install with:
     pip install -e ".[yolo]"
@@ -20,13 +25,9 @@ class YOLOBackboneEncoder(VisualPriorEncoder):
     """YOLOv8 backbone features as visual prior.
 
     Strips detection head, takes features from specified level (P3/P4/P5).
-    Pretrained on COCO object detection.
+    Pretrained on COCO object detection. Input expected in [0, 1].
 
     Output: (B, N_spatial, C) — spatial token sequence.
-
-    TODO(integration): The exact way to slice YOLO internals depends on
-    Ultralytics version. We pin ultralytics<9.0 in pyproject.toml, but
-    if the slicing fails check `yolo_full.model.model` structure.
     """
 
     def __init__(
@@ -44,11 +45,7 @@ class YOLOBackboneEncoder(VisualPriorEncoder):
 
         self.feature_level = feature_level
 
-        # Load pretrained YOLO and extract backbone
         yolo_full = YOLO(f"{model_name}.pt")
-        # YOLOv8 structure: model.model is a Sequential of blocks
-        # First N blocks are backbone (CSPDarknet), last 3 are detection head
-        # TODO(integration): verify [:-3] slicing matches your ultralytics version
         full_layers = list(yolo_full.model.model.children())
 
         if len(full_layers) < feature_level + 1:
@@ -57,19 +54,25 @@ class YOLOBackboneEncoder(VisualPriorEncoder):
                 f"({len(full_layers)})"
             )
 
-        # Keep only backbone layers up to feature_level
         self.layers = nn.ModuleList(full_layers[: feature_level + 1])
 
-        # Determine output shape via dummy forward
+        # YOLOv8 expects ImageNet-normalized inputs when called directly
+        # (we bypass yolo.predict() which would normalize internally).
+        self._register_imagenet_norm()
+
+        # Determine output shape via dummy forward.
+        # NOTE: we run the dummy through the SAME normalization the real path
+        # uses, otherwise BN running stats would be inferred from off-distribution
+        # data. Buffers are on CPU here; the dummy is on CPU too — fine.
         self.output_dim, self.num_spatial_tokens = self._infer_output_shape()
 
     def _infer_output_shape(self) -> tuple[int, int]:
-        """Run dummy forward to find output dim and spatial size."""
         self.eval()
         with torch.no_grad():
-            dummy = torch.zeros(1, 3, 224, 224)
-            out = self._forward_backbone(dummy)
-        # out: (1, C, H', W')
+            # Use mid-range values so BN doesn't see degenerate zeros input
+            dummy = torch.full((1, 3, 224, 224), 0.5)
+            x = self._imagenet_normalize(dummy)
+            out = self._forward_backbone(x)
         _, c, h, w = out.shape
         return c, h * w
 
@@ -79,7 +82,9 @@ class YOLOBackboneEncoder(VisualPriorEncoder):
         return x
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        features = self._forward_backbone(images)  # (B, C, H', W')
+        # Input in [0, 1] → ImageNet-normalize → backbone.
+        x = self._imagenet_normalize(images)
+        features = self._forward_backbone(x)  # (B, C, H', W')
         b, c, h, w = features.shape
         return features.permute(0, 2, 3, 1).reshape(b, h * w, c)
 
@@ -112,7 +117,6 @@ class YOLOBBoxEncoder(VisualPriorEncoder):
         self.topk = topk
         self.yolo = YOLO(f"{model_name}.pt")
 
-        # Each box: (x, y, w, h, conf) + class one-hot (80 for COCO)
         per_box_dim = self.BOX_DIM + self.NUM_COCO_CLASSES
         self.output_dim = per_box_dim
         self.num_spatial_tokens = topk
@@ -120,35 +124,24 @@ class YOLOBBoxEncoder(VisualPriorEncoder):
     @torch.no_grad()
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         """Run YOLO inference, extract top-K boxes, encode."""
-        # YOLO expects uint8 or [0,1] tensors of shape (B, 3, H, W)
-        # We're given normalized ImageNet tensors — denormalize for YOLO
-        # then YOLO will re-normalize internally
-        # Simpler: pass denormalized [0, 1]
-        from torchvision.transforms.functional import normalize
-
-        mean = torch.tensor([0.485, 0.456, 0.406], device=images.device).view(
-            1, 3, 1, 1
-        )
-        std = torch.tensor([0.229, 0.224, 0.225], device=images.device).view(
-            1, 3, 1, 1
-        )
-        denorm = (images * std + mean).clamp(0, 1)
-
-        B = denorm.shape[0]
+        # We get images in [0, 1] from the policy (preprocessor is IDENTITY for
+        # VISUAL). YOLO.predict() handles its own normalization internally, so
+        # we pass [0, 1] tensors directly. NO denormalization needed.
+        B = images.shape[0]
         device = images.device
         out = torch.zeros(B, self.topk, self.output_dim, device=device)
 
-        # YOLO predict expects list of images (B, C, H, W) handled internally
-        results = self.yolo.predict(denorm, verbose=False)
+        # Clamp to [0, 1] defensively (e.g. floating-point drift from resize).
+        clipped = images.clamp(0.0, 1.0)
+        results = self.yolo.predict(clipped, verbose=False)
 
         for i, res in enumerate(results):
             if res.boxes is None or len(res.boxes) == 0:
                 continue
-            # Sort by confidence
             confs = res.boxes.conf
             idx = torch.argsort(confs, descending=True)[: self.topk]
 
-            xywhn = res.boxes.xywhn[idx]  # normalized (x, y, w, h)
+            xywhn = res.boxes.xywhn[idx]  # normalized (x, y, w, h) in [0, 1]
             conf = res.boxes.conf[idx].unsqueeze(-1)  # (K, 1)
             cls = res.boxes.cls[idx].long()  # (K,)
 
@@ -160,7 +153,7 @@ class YOLOBBoxEncoder(VisualPriorEncoder):
 
             features = torch.cat(
                 [box_features, class_onehot], dim=-1
-            )  # (K, 5+80)
+            )  # (K, 85)
             out[i, : features.shape[0]] = features
 
         return out
