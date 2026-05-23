@@ -17,12 +17,25 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Literal, Optional
+from typing import Optional
 
 from lerobot.configs import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 from lerobot.optim import AdamWConfig
-from lerobot.optim import CosineDecayWithWarmupSchedulerConfig
+
+
+# Valid encoder identifiers (replaces the old Literal[...] type — see config).
+VALID_ENCODERS = frozenset({
+    "resnet18",
+    "vae",
+    "beta_vae",
+    "vqvae",
+    "yolo",
+    "unet",
+    "yolo_bbox",
+    "sam2",
+    "dinov2",
+})
 
 
 @PreTrainedConfig.register_subclass("visualprior_act")
@@ -66,17 +79,10 @@ class VisualPriorACTConfig(PreTrainedConfig):
     temporal_ensemble_coeff: Optional[float] = None
 
     # ---------- Visual encoder choice ----------
-    encoder: Literal[
-        "resnet18",
-        "vae",
-        "beta_vae",
-        "vqvae",
-        "yolo",
-        "unet",
-        "yolo_bbox",
-        "sam2",
-        "dinov2",
-    ] = "resnet18"
+    # NOTE: draccus (lerobot's CLI parser) doesn't support Literal types
+    # with many options, so we use plain str + runtime validation in
+    # __post_init__ against VALID_ENCODERS below.
+    encoder: str = "resnet18"
 
     # Unified output dimension — projector maps every encoder to this
     projector_dim: int = 256
@@ -138,6 +144,14 @@ class VisualPriorACTConfig(PreTrainedConfig):
     def __post_init__(self):
         super().__post_init__()
 
+        # Validate encoder choice (replaces the type system check we lost
+        # when switching from Literal[...] to plain str for draccus compat).
+        if self.encoder not in VALID_ENCODERS:
+            raise ValueError(
+                f"encoder='{self.encoder}' is invalid. "
+                f"Choose one of: {sorted(VALID_ENCODERS)}"
+            )
+
         # VAE family requires pretrained weights
         if self.encoder in ("vae", "beta_vae", "vqvae"):
             if self.vae_pretrained_path is None:
@@ -193,18 +207,25 @@ class VisualPriorACTConfig(PreTrainedConfig):
         )
 
     def get_scheduler_preset(self):
-        return CosineDecayWithWarmupSchedulerConfig(
-            num_warmup_steps=1000,
-            num_decay_steps=100_000,
-        )
+        # Match standard lerobot ACTConfig — return None for a constant LR.
+        # This ensures M0 (resnet18 baseline) is fairly comparable to stock ACT,
+        # since the only architectural difference is then the visual encoder
+        # path (not the optimization schedule).
+        return None
 
     # ============================================================
     #               Delta indices (required by PreTrainedConfig)
     # ============================================================
 
     @property
-    def observation_delta_indices(self) -> list[int]:
-        return list(range(1 - self.n_obs_steps, 1))
+    def observation_delta_indices(self) -> None:
+        # Match stock ACT: return None for plain non-temporal observations.
+        # This ensures batch[OBS_STATE] arrives as (B, state_dim) — flat 2D,
+        # the same shape the standard ACT VAE encoder expects. If we returned
+        # a list (even [0]) the dataloader would add a temporal dim and the
+        # VAE encoder's cat over [cls, state, action] would fail with rank
+        # mismatch (state 3D vs action 3D, but cls 3D — same shape needed).
+        return None
 
     @property
     def action_delta_indices(self) -> list[int]:

@@ -15,7 +15,7 @@ try:
     import lerobot  # noqa: F401
 except ImportError as e:
     raise ImportError(
-        "lerobot is not installed. Install lerobot >= 0.5.0 first:\n"
+        "lerobot is not installed. Install lerobot >= 0.4.0 first:\n"
         "    cd ~/projects/lerobot && pip install -e ."
     ) from e
 

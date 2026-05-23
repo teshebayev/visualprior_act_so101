@@ -34,12 +34,17 @@ from ..encoders.vae_family import VAEEncoder, VQVAEEncoder
 
 
 class FramesOnlyDataset(Dataset):
-    """Extract individual frames from a LeRobotDataset for unsupervised pretraining."""
+    """Extract individual frames from a LeRobotDataset for unsupervised pretraining.
+
+    Supports multiple camera keys — if more than one key is given, each
+    timestep produces num_keys items (one per camera), effectively
+    multiplying training data without any architecture changes.
+    """
 
     def __init__(
         self,
         repo_id: str,
-        image_key: str = "observation.images.front",
+        image_keys: str | list[str] = "observation.images.front",
         image_size: int = 224,
     ):
         try:
@@ -51,22 +56,32 @@ class FramesOnlyDataset(Dataset):
             ) from e
 
         self.ds = LeRobotDataset(repo_id)
-        self.image_key = image_key
+        # Normalize to a list internally.
+        self.image_keys: list[str] = (
+            [image_keys] if isinstance(image_keys, str) else list(image_keys)
+        )
         self.image_size = image_size
 
-        if image_key not in self.ds.features:
+        # Validate every requested key exists in the dataset features.
+        missing = [k for k in self.image_keys if k not in self.ds.features]
+        if missing:
             available = [k for k in self.ds.features if "image" in k.lower()]
             raise ValueError(
-                f"image_key='{image_key}' not in dataset. "
+                f"image_keys {missing} not in dataset. "
                 f"Available image keys: {available}"
             )
 
     def __len__(self):
-        return len(self.ds)
+        return len(self.ds) * len(self.image_keys)
 
     def __getitem__(self, idx):
-        sample = self.ds[idx]
-        img = sample[self.image_key]
+        # Stretch dataset by num_cameras: every frame contributes once per camera.
+        n_keys = len(self.image_keys)
+        ds_idx = idx // n_keys
+        key = self.image_keys[idx % n_keys]
+
+        sample = self.ds[ds_idx]
+        img = sample[key]
         # img typically (C, H, W) float [0, 1]
         if img.dim() == 4:
             img = img[-1]  # take last frame if temporal
@@ -144,10 +159,29 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     console.print(f"[bold]Pretraining {args.encoder_type}[/bold] on {device}")
 
+    # Resolve image keys: --all-cameras flag overrides --image-key; otherwise
+    # treat --image-key as comma-separated list (single key still works).
+    if args.all_cameras:
+        # Auto-discover all observation.images.* keys from dataset metadata.
+        from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        peek = LeRobotDataset(args.dataset_repo_id)
+        image_keys = sorted(
+            k for k in peek.features if k.startswith("observation.images")
+        )
+        del peek
+        if not image_keys:
+            raise ValueError("--all-cameras: no observation.images.* in dataset")
+        console.print(f"[cyan]--all-cameras → using {image_keys}[/cyan]")
+    else:
+        image_keys = [k.strip() for k in args.image_key.split(",") if k.strip()]
+
     # Dataset
     console.print(f"Loading dataset: {args.dataset_repo_id}")
-    ds = FramesOnlyDataset(args.dataset_repo_id, image_key=args.image_key)
-    console.print(f"  {len(ds)} frames available")
+    ds = FramesOnlyDataset(args.dataset_repo_id, image_keys=image_keys)
+    console.print(
+        f"  {len(ds)} frames available "
+        f"({len(ds) // len(image_keys)} timesteps × {len(image_keys)} cameras)"
+    )
 
     loader = DataLoader(
         ds,
@@ -246,7 +280,25 @@ def main():
         description="Pretrain a VAE-family visual encoder on LeRobotDataset frames"
     )
     parser.add_argument("--dataset-repo-id", required=True)
-    parser.add_argument("--image-key", default="observation.images.front")
+    parser.add_argument(
+        "--image-key",
+        default="observation.images.front",
+        help=(
+            "Camera key to use. Pass a single key (e.g. observation.images.camera1) "
+            "or a comma-separated list to use multiple cameras: "
+            "observation.images.camera1,observation.images.camera2"
+        ),
+    )
+    parser.add_argument(
+        "--all-cameras",
+        action="store_true",
+        help=(
+            "Auto-discover all observation.images.* keys in the dataset and "
+            "train on frames from every camera. Overrides --image-key. "
+            "Recommended for datasets with multiple camera views — multiplies "
+            "effective training data by num_cameras with no architecture changes."
+        ),
+    )
     parser.add_argument(
         "--encoder-type",
         choices=["vae", "beta_vae", "vqvae"],
